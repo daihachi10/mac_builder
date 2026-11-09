@@ -162,9 +162,14 @@ enum WavePCM {
     final class Writer {
         static let rate = 16000
         private let file: FileHandle
+        private let enhanceSpeech: Bool
+        private var gain = 1.0
+        private var previousInput = 0.0
+        private var previousOutput = 0.0
         private(set) var byteCount: UInt64 = 0
 
-        init(_ url: URL) throws {
+        init(_ url: URL, enhanceSpeech: Bool = false) throws {
+            self.enhanceSpeech = enhanceSpeech
             guard FileManager.default.createFile(atPath: url.path, contents: nil) else { throw CocoaError(.fileWriteUnknown) }
             file = try FileHandle(forWritingTo: url)
             try file.write(contentsOf: Data(repeating: 0, count: 44))
@@ -174,8 +179,42 @@ enum WavePCM {
 
         func write(_ data: Data) throws {
             guard byteCount + UInt64(data.count) <= UInt64(UInt32.max - 36) else { throw Failure.tooLarge }
-            try file.write(contentsOf: data)
+            try file.write(contentsOf: enhanceSpeech ? enhanced(data) : data)
             byteCount += UInt64(data.count)
+        }
+
+        private func enhanced(_ data: Data) -> Data {
+            let samples = data.withUnsafeBytes { (input: UnsafeRawBufferPointer) -> [Int16] in
+                var result: [Int16] = []
+                result.reserveCapacity(input.count / 2)
+                // Use 32 ms windows. Reject very low levels and cap the boost
+                // so pauses and room noise cannot drive gain without bounds.
+                for start in stride(from: 0, to: input.count, by: 1024) {
+                    let end = min(start + 1024, input.count)
+                    var filtered: [Double] = []
+                    filtered.reserveCapacity((end - start) / 2)
+                    var energy = 0.0
+                    var peak = 0.0
+                    for index in stride(from: start, to: end, by: 2) {
+                        let value = Double(Int16(littleEndian: input.loadUnaligned(fromByteOffset: index, as: Int16.self)))
+                        let highPassed = 0.97 * (previousOutput + value - previousInput)
+                        previousInput = value
+                        previousOutput = highPassed
+                        filtered.append(highPassed)
+                        energy += highPassed * highPassed
+                        peak = max(peak, abs(highPassed))
+                    }
+                    let rms = (energy / Double(filtered.count)).squareRoot()
+                    let boost = rms < 32 ? 1 : min(16, max(1, 3300 / rms))
+                    let target = min(boost, 29000 / max(1, peak))
+                    for value in filtered {
+                        gain += (target - gain) * (target < gain ? 0.015 : 0.0015)
+                        result.append(WavePCM.quantize(max(-29000, min(29000, value * gain))))
+                    }
+                }
+                return result
+            }
+            return samples.withUnsafeBufferPointer { Data(buffer: $0) }
         }
 
         func write(_ samples: [Int16]) throws {

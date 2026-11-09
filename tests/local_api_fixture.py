@@ -1,11 +1,10 @@
 """Loopback HTTPS fixture for real URLSession/XCUITest. Never calls any AI."""
 import argparse
 import hashlib
-import io
 import json
 import ssl
 import threading
-import wave
+import struct
 from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -101,9 +100,14 @@ class Handler(BaseHTTPRequestHandler):
                 message = BytesParser(policy=default).parsebytes(('Content-Type: '+self.headers['Content-Type']+'\r\nMIME-Version: 1.0\r\n\r\n').encode()+data)
                 part = next(p for p in message.iter_parts() if p.get_filename())
                 content = part.get_payload(decode=True)
-                with wave.open(io.BytesIO(content)) as audio:
-                    assert audio.getframerate() == 16000 and audio.getnchannels() == 1 and audio.getsampwidth() == 2
-                    seconds = audio.getnframes() / audio.getframerate()
+                assert part.get_filename().endswith('.m4a') and part.get_content_type() == 'audio/mp4'
+                assert content[4:8] == b'ftyp' and b'mp4a' in content
+                header = content.index(b'mvhd') + 4
+                if content[header] == 1:
+                    timescale, duration = struct.unpack_from('>IQ', content, header + 20)
+                else:
+                    timescale, duration = struct.unpack_from('>II', content, header + 12)
+                seconds = duration / timescale
                 identity = part.get_filename() + hashlib.sha256(content).hexdigest()
                 if identity not in STATE['jobs']:
                     STATE['jobs'][identity] = {'id': 'ui-job-'+str(len(STATE['jobs'])+1), 'original_name': query.get('display_name', ['録音'])[0], 'status': 'completed', 'progress': '完了', 'generated': []}

@@ -62,14 +62,14 @@ func voiceErrorDescription(_ error: Error) -> String {
 }
 
 enum RecordingFiles {
-    static func exportAudio(_ parts: [URL], to output: URL) async throws {
+    static func exportAudio(_ parts: [URL], to output: URL, enhanceSpeech: Bool = true) async throws {
         if output.pathExtension == "wav" {
-            try await export(parts, to: output)
+            try await export(parts, to: output, enhanceSpeech: enhanceSpeech)
             return
         }
-        let wav = output.deletingLastPathComponent().appendingPathComponent("working.wav")
+        let wav = output.deletingLastPathComponent().appendingPathComponent("export-working-" + UUID().uuidString + ".wav")
         defer { try? FileManager.default.removeItem(at: wav) }
-        try await export(parts, to: wav)
+        try await export(parts, to: wav, enhanceSpeech: enhanceSpeech)
         try Task.checkCancellation()
         let asset = AVURLAsset(url: wav)
         guard let session = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetAppleM4A) else {
@@ -91,18 +91,18 @@ enum RecordingFiles {
         if layout.needsRepair { return (try? WavePCM.repairedCopy(of: url, layout: layout)) ?? url }
         return url
     }
-    static func export(_ parts: [URL], to output: URL) async throws {
+    static func export(_ parts: [URL], to output: URL, enhanceSpeech: Bool = false) async throws {
         // PCM conversion runs away from the UI and never needs the AAC encoder.
-        try await Task.detached(priority: .userInitiated) { try mergePCM(parts, to: output) }.value
+        try await Task.detached(priority: .userInitiated) { try mergePCM(parts, to: output, enhanceSpeech: enhanceSpeech) }.value
     }
-    private static func mergePCM(_ parts: [URL], to output: URL) throws {
+    private static func mergePCM(_ parts: [URL], to output: URL, enhanceSpeech: Bool) throws {
         guard !parts.isEmpty, output.pathExtension.lowercased() == "wav" else {
             throw NSError(domain: "VoiceAudio", code: 1, userInfo: [NSLocalizedDescriptionKey: "結合する録音、またはWAV保存先がありません"])
         }
         let staging = output.deletingPathExtension().appendingPathExtension("partial.wav")
         if FileManager.default.fileExists(atPath: staging.path) { try FileManager.default.removeItem(at: staging) }
         do {
-            let writer = try WavePCM.Writer(staging)
+            let writer = try WavePCM.Writer(staging, enhanceSpeech: enhanceSpeech)
             for url in parts {
                 do {
                     do { try WavePCM.append(url, to: writer) }

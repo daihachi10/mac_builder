@@ -82,7 +82,7 @@ final class Capture: @unchecked Sendable {
         let session = AVAudioSession.sharedInstance()
         var started = false
         defer { if !started { try? session.setActive(false) } }
-        try session.setCategory(.record, mode: .measurement, options: [])
+        try session.setCategory(.record, mode: .default, options: [])
         try session.setPreferredSampleRate(44100)
         try session.setActive(true)
         if session.maximumInputNumberOfChannels > 0 { try? session.setPreferredInputNumberOfChannels(1) }
@@ -390,16 +390,21 @@ final class Capture: @unchecked Sendable {
             let id = pending.removeFirst()
             guard let i = clips.firstIndex(where: { $0.id == id && !$0.deleted }) else { continue }
             sendingID = id; clips[i].phase = "sending"; save()
-            var stage = "録音の結合"
+            var stage = "音量補正・M4A変換"
             do {
                 let clip = clips[i]
                 guard clip.unavailableParts?.isEmpty != false else { throw NSError(domain: "VoiceAudio", code: 4, userInfo: [NSLocalizedDescriptionKey: "録音区間の一部を読み込めません"]) }
-                sendStatus = "録音を1つのファイルにまとめています…"
-                let exported = root.appendingPathComponent(id).appendingPathComponent("export-pcm-v2-\(clip.revision ?? 0).wav")
+                sendStatus = "音量を整えてM4Aに変換しています…"
+                let exported = root.appendingPathComponent(id).appendingPathComponent("export-speech-v1-\(clip.revision ?? 0).m4a")
                 let cachedDuration = RecordingFiles.duration(exported)
-                if cachedDuration <= 0 || abs(cachedDuration - clip.duration) > max(0.01, clip.duration * 0.0001) {
+                if cachedDuration <= 0 || abs(cachedDuration - clip.duration) > max(0.15, clip.duration * 0.0001) {
                     try FileManager.default.createDirectory(at: exported.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try await RecordingFiles.export(clip.parts.map { root.appendingPathComponent($0) }, to: exported)
+                    let staging = exported.deletingLastPathComponent().appendingPathComponent("export-staging.m4a")
+                    defer { try? FileManager.default.removeItem(at: staging) }
+                    if FileManager.default.fileExists(atPath: staging.path) { try FileManager.default.removeItem(at: staging) }
+                    try await RecordingFiles.exportAudio(clip.parts.map { root.appendingPathComponent($0) }, to: staging)
+                    if FileManager.default.fileExists(atPath: exported.path) { try FileManager.default.removeItem(at: exported) }
+                    try FileManager.default.moveItem(at: staging, to: exported)
                 }
                 sendStatus = "録音を送信中…"
                 stage = "送信データの準備"
@@ -407,12 +412,12 @@ final class Capture: @unchecked Sendable {
                 let temp = root.appendingPathComponent("\(boundary).tmp")
                 defer { try? FileManager.default.removeItem(at: temp) }
                 // Stable identity survives rename and a lost HTTP response.
-                let filename = "\(id)_r\(clip.revision ?? 0)_\(clip.stt ?? "local").wav"
+                let filename = "\(id)_r\(clip.revision ?? 0)_\(clip.stt ?? "local").m4a"
                 FileManager.default.createFile(atPath: temp.path, contents: nil)
                 let destination = try FileHandle(forWritingTo: temp)
                 let source = try FileHandle(forReadingFrom: exported)
                 do {
-                    try destination.write(contentsOf: Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"files\"; filename=\"\(filename)\"\r\nContent-Type: audio/wav\r\n\r\n".utf8))
+                    try destination.write(contentsOf: Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"files\"; filename=\"\(filename)\"\r\nContent-Type: audio/mp4\r\n\r\n".utf8))
                     while let block = try source.read(upToCount: 1024 * 1024), !block.isEmpty { try destination.write(contentsOf: block) }
                     try destination.write(contentsOf: Data("\r\n--\(boundary)--\r\n".utf8))
                     try source.close(); try destination.close()

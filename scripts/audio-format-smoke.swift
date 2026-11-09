@@ -115,7 +115,32 @@ enum AudioFormatChecks {
     static func main() async throws {
         try await AudioFormatChecks.run()
         try verifyPermanentDeletion()
+        try await verifySpeechGain()
         if CommandLine.arguments.contains("--long") { try await verifyNinetyMinutes() }
+    }
+
+    static func verifySpeechGain() async throws {
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let input = folder.appendingPathComponent("quiet.wav")
+        let output = folder.appendingPathComponent("enhanced.wav")
+        let writer = try WavePCM.Writer(input)
+        let quiet = (0..<16000).map { Int16(sin(Double($0) * 0.2) * 160) }
+        let loud = (0..<16000).map { Int16(sin(Double($0) * 0.2) * 31000) }
+        try writer.write(quiet + loud + Array(repeating: 0, count: 16000))
+        try writer.finish()
+        try await RecordingFiles.exportAudio([input], to: output)
+        let file = try AVAudioFile(forReading: output)
+        let buffer = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: 48000)!
+        try file.read(into: buffer)
+        let samples = buffer.floatChannelData![0]
+        func peak(_ range: Range<Int>) -> Float { range.map { abs(samples[$0]) }.max() ?? 0 }
+        guard buffer.frameLength == 48000, peak(8000..<16000) > 0.05,
+              peak(16000..<32000) < 0.9, peak(40000..<48000) == 0 else {
+            fatalError("Speech gain did not raise quiet audio, limit loud peaks, and preserve silence")
+        }
+        print("PASS quiet speech gain, peak limit and silent tail")
     }
 
     static func verifyPermanentDeletion() throws {
@@ -169,7 +194,10 @@ enum AudioFormatChecks {
         let compact = folder.appendingPathComponent("ninety-minutes.m4a")
         try await RecordingFiles.exportAudio([output], to: compact)
         guard abs(RecordingFiles.duration(compact) - 5400) < 0.2 else { fatalError("90-minute M4A duration mismatch") }
-        print("PASS 90-minute M4A export")
+        let wavBytes = try output.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        let m4aBytes = try compact.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
+        guard m4aBytes > 0, m4aBytes < wavBytes * 2 / 3 else { fatalError("M4A did not sufficiently reduce upload size") }
+        print("PASS 90-minute M4A export: \(m4aBytes) bytes vs \(wavBytes) WAV bytes")
     }
 }
 #endif

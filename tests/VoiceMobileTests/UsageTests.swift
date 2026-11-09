@@ -46,10 +46,11 @@ import AVFoundation
         let boundary = r.value(forHTTPHeaderField:"Content-Type")!.components(separatedBy:"boundary=")[1]
         let start = data.range(of:Data("\r\n\r\n".utf8))!.upperBound
         let end = data.range(of:Data("\r\n--\(boundary)--".utf8),options:.backwards)!.lowerBound
-        let wave = data.subdata(in:start..<end)
-        XCTAssertEqual(String(decoding:wave.prefix(4),as:UTF8.self), "RIFF")
-        let extracted = file.deletingLastPathComponent().appendingPathComponent(UUID().uuidString+".wav")
-        try wave.write(to:extracted)
+        let audio = data.subdata(in:start..<end)
+        XCTAssertEqual(String(decoding:audio.dropFirst(4).prefix(4),as:UTF8.self), "ftyp")
+        XCTAssertTrue(name.hasSuffix(".m4a"))
+        let extracted = file.deletingLastPathComponent().appendingPathComponent(UUID().uuidString+".m4a")
+        try audio.write(to:extracted)
         uploadedDurations.append(RecordingFiles.duration(extracted))
         try FileManager.default.removeItem(at:extracted)
         concurrent += 1; maximumConcurrent = max(maximumConcurrent,concurrent)
@@ -246,8 +247,8 @@ import AVFoundation
     func testTruncatedCachedExportIsRebuilt() async throws {
         let network = UsageTransport(), store = try makeStore(network), clip = try addClip(store,seconds:0.8)
         let short = try addClip(store,seconds:0.1)
-        let cached = store.root.appendingPathComponent(clip.id).appendingPathComponent("export-pcm-v2-1.wav")
-        try FileManager.default.copyItem(at:store.root.appendingPathComponent(short.parts[0]),to:cached)
+        let cached = store.root.appendingPathComponent(clip.id).appendingPathComponent("export-speech-v1-1.m4a")
+        try await RecordingFiles.exportAudio([store.root.appendingPathComponent(short.parts[0])], to: cached)
         store.finish(clip.id)
         try await waitUntil({!store.isBusy(clip.id)})
         XCTAssertEqual(network.uploadedDurations[0],0.8,accuracy:0.01)
