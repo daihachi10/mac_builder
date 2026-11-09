@@ -1,0 +1,58 @@
+name: VoiceMobile
+options:
+  bundleIdPrefix: jp.localvoice
+  deploymentTarget:
+    iOS: "26.0"
+targets:
+  VoiceMobile:
+    type: application
+    platform: iOS
+    sources: [VoiceMobileApp.swift, AudioFileWriter.swift, WavePCM.swift, RecordingSupport.swift, RecordingCatalog.swift, VoiceTransport.swift, ArtifactReading.swift, scripts/audio-format-smoke.swift]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.daihachi10.VoiceMobile
+        MARKETING_VERSION: "1.2.0"
+        CURRENT_PROJECT_VERSION: "43"
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: 録音した音声を文字起こしするためにマイクを使用します。
+        INFOPLIST_FILE: Info.plist
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        SUPPORTS_MACCATALYST: NO
+        CODE_SIGNING_ALLOWED: NO
+  VoiceMobileTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [tests/VoiceMobileTests]
+    dependencies:
+      - target: VoiceMobile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO
+        SWIFT_VERSION: "5.0"
+  VoiceMobileUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [tests/VoiceMobileUITests]
+    dependencies:
+      - target: VoiceMobile
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGNING_ALLOWED: NO
+        SWIFT_VERSION: "5.0"
+        TEST_TARGET_NAME: VoiceMobile
+schemes:
+  VoiceMobileUI:
+    build:
+      targets:
+        VoiceMobile: all
+    test:
+      targets: [VoiceMobileUITests]
+  VoiceMobile:
+    build:
+      targets:
+        VoiceMobile: all
+    test:
+      targets: [VoiceMobileTests]

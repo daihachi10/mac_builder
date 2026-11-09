@@ -1,0 +1,72 @@
+name: Local-only usage audit
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, 'audit/**']
+    paths: ['**/*.swift', 'project.yml', 'tests/**', '.github/workflows/deep-audit.yml']
+permissions:
+  contents: read
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  usage:
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        family: [iPhone, iPad]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Generate project
+        run: |
+          brew install xcodegen
+          xcodegen generate
+      - name: Find a simulator
+        env:
+          DEVICE_FAMILY: ${{ matrix.family }}
+        run: |
+          xcrun simctl list devices available -j > "$RUNNER_TEMP/devices.json"
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import json, os
+          devices = [d for ds in json.load(open(os.environ['RUNNER_TEMP']+'/devices.json'))['devices'].values() for d in ds if d.get('isAvailable')]
+          print('AUDIT_DEVICE='+next(d['udid'] for d in devices if d['name'].startswith(os.environ['DEVICE_FAMILY'])))
+          PY
+      - name: Start an isolated local HTTPS server with no AI access
+        run: |
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 -config tests/localhost.cnf -keyout "$RUNNER_TEMP/localhost.key" -out "$RUNNER_TEMP/localhost.crt"
+          python3 tests/local_api_fixture.py --cert "$RUNNER_TEMP/localhost.crt" --key "$RUNNER_TEMP/localhost.key" > "$RUNNER_TEMP/fixture.log" 2>&1 &
+          xcrun simctl boot "$AUDIT_DEVICE" || true
+          xcrun simctl bootstatus "$AUDIT_DEVICE" -b
+          xcrun simctl keychain "$AUDIT_DEVICE" add-root-cert "$RUNNER_TEMP/localhost.crt"
+      - name: Exercise application recording, recovery, retry and results
+        run: |
+          xcodebuild test -project VoiceMobile.xcodeproj -scheme VoiceMobile -configuration Debug -parallel-testing-enabled NO -destination "platform=iOS Simulator,id=$AUDIT_DEVICE" -resultBundlePath "$RUNNER_TEMP/Usage.xcresult" CODE_SIGNING_ALLOWED=NO SWIFT_OPTIMIZATION_LEVEL=-O
+      - name: Operate the real recording, retry, recovery, copy and summary screens
+        run: |
+          xcodebuild test -project VoiceMobile.xcodeproj -scheme VoiceMobileUI -configuration Debug -parallel-testing-enabled NO -test-timeouts-enabled YES -maximum-test-execution-time-allowance 180 -destination "platform=iOS Simulator,id=$AUDIT_DEVICE" -resultBundlePath "$RUNNER_TEMP/Journeys.xcresult" CODE_SIGNING_ALLOWED=NO
+      - name: Export readable results and screenshots
+        if: always()
+        run: |
+          mkdir -p "$RUNNER_TEMP/reports"
+          for suite in Usage Journeys; do
+            if test -d "$RUNNER_TEMP/$suite.xcresult"; then
+              xcrun xcresulttool get test-results summary --path "$RUNNER_TEMP/$suite.xcresult" > "$RUNNER_TEMP/reports/$suite-summary.json" || true
+              xcrun xcresulttool export attachments --path "$RUNNER_TEMP/$suite.xcresult" --output-path "$RUNNER_TEMP/reports/$suite-attachments" || true
+            fi
+          done
+          container=$(xcrun simctl get_app_container "$AUDIT_DEVICE" com.daihachi10.VoiceMobile data 2>/dev/null || true)
+          if test -d "$container/Documents/UITestRecordings"; then
+            cp -R "$container/Documents/UITestRecordings" "$RUNNER_TEMP/reports/synthetic-recordings"
+          fi
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: VoiceMobile-${{ matrix.family }}-usage-test-results
+          path: |
+            ${{ runner.temp }}/Usage.xcresult
+            ${{ runner.temp }}/Journeys.xcresult
+            ${{ runner.temp }}/fixture.log
+            ${{ runner.temp }}/reports
+          if-no-files-found: warn

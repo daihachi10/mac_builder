@@ -1,0 +1,50 @@
+name: Build iOS IPA
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['**/*.swift', 'Info.plist', 'project.yml', '.github/workflows/build-ios.yml']
+permissions:
+  contents: read
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  build:
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - name: Generate Xcode project
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+          xcodegen generate --spec project.yml
+      - name: Build unsigned iPhone and iPad app
+        run: >-
+          xcodebuild -project VoiceMobile.xcodeproj -scheme VoiceMobile
+          -configuration Release -sdk iphoneos -destination 'generic/platform=iOS'
+          -derivedDataPath "$RUNNER_TEMP/DerivedData"
+          CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
+      - name: Verify recording formats
+        run: |
+          xcrun swiftc -O -target "$(uname -m)-apple-macos15.0" AudioFileWriter.swift WavePCM.swift RecordingSupport.swift RecordingCatalog.swift scripts/audio-format-smoke.swift -o "$RUNNER_TEMP/audio-smoke"
+          "$RUNNER_TEMP/audio-smoke" --long
+      - name: Package and verify IPA
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -R "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/VoiceMobile.app" "$RUNNER_TEMP/Payload/"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$RUNNER_TEMP/Payload/VoiceMobile.app/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$RUNNER_TEMP/Payload/VoiceMobile.app/Info.plist"
+          ditto -c -k --sequesterRsrc --keepParent "$RUNNER_TEMP/Payload" "$RUNNER_TEMP/VoiceMobile.ipa"
+          unzip -t "$RUNNER_TEMP/VoiceMobile.ipa"
+          shasum -a 256 "$RUNNER_TEMP/VoiceMobile.ipa" > "$RUNNER_TEMP/VoiceMobile.ipa.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoiceMobile-ipa
+          path: |
+            ${{ runner.temp }}/VoiceMobile.ipa
+            ${{ runner.temp }}/VoiceMobile.ipa.sha256
+          if-no-files-found: error
+          retention-days: 14

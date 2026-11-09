@@ -1,0 +1,15 @@
+.DS_Store
+*.xcodeproj/
+DerivedData/
+build/
+*.ipa
+*.m4a
+*.wav
+*.mobileprovision
+*.p12
+*.xcuserstate
+xcuserdata/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
