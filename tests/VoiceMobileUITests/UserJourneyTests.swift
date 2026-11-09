@@ -140,7 +140,13 @@ import XCTest
         let row = app.cells.containing(.staticText,identifier:"Keep My Audio").firstMatch
         XCTAssertTrue(row.waitForExistence(timeout:5)); row.swipeLeft(); app.buttons["削除"].firstMatch.tap()
         app.buttons["library.menu"].tap(); pick("最近削除した項目")
-        XCTAssertTrue(row.waitForExistence(timeout:5)); row.swipeLeft(); app.buttons["復元"].firstMatch.tap()
+        XCTAssertTrue(row.waitForExistence(timeout:5)); row.swipeLeft()
+        app.buttons["完全に削除"].firstMatch.tap()
+        let cancel = app.buttons["キャンセル"].firstMatch
+        XCTAssertTrue(cancel.waitForExistence(timeout:5)); cancel.tap()
+        XCTAssertTrue(row.exists)
+        if !app.buttons["復元"].firstMatch.isHittable { row.swipeLeft() }
+        app.buttons["復元"].firstMatch.tap()
         app.buttons["library.menu"].tap(); pick("この端末")
         XCTAssertTrue(row.waitForExistence(timeout:5)); row.tap()
         XCTAssertTrue(app.buttons["recording.resume"].waitForExistence(timeout:5))

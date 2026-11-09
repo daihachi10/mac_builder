@@ -255,6 +255,10 @@ final class Capture: @unchecked Sendable {
     }
     func refresh(showError: Bool = false) async {
         guard !preview else { return }
+        guard !server.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            if showError { error = "設定に文字起こしサーバーのHTTPS URLを入力してください。" }
+            return
+        }
         do { jobs = try JSONDecoder().decode(JobsReply.self, from: await request("/api/jobs")).jobs; connectionMessage = "" }
         catch {
             connectionMessage = "サーバーに接続できません。録音は端末内に保存できます。"
@@ -560,6 +564,12 @@ extension Store: AVAudioPlayerDelegate {
 @main struct VoiceMobileApp: App {
     @StateObject var store = VoiceMobileApp.makeStore()
     @MainActor static func makeStore() -> Store {
+        let temporary = FileManager.default.temporaryDirectory
+        let oldExports = (try? FileManager.default.contentsOfDirectory(at: temporary, includingPropertiesForKeys: nil)) ?? []
+        for folder in oldExports where folder.lastPathComponent.hasPrefix("voice-export-") {
+            let suffix = String(folder.lastPathComponent.dropFirst("voice-export-".count))
+            if UUID(uuidString: suffix) != nil { try? FileManager.default.removeItem(at: folder) }
+        }
         #if DEBUG && targetEnvironment(simulator)
         let args = ProcessInfo.processInfo.arguments
         if let index = args.firstIndex(of: "--ui-test-server"), args.indices.contains(index + 1),
@@ -710,14 +720,17 @@ struct ClipView: View {
     @State private var choosingExport = false
     @State private var exportFile: ExportFile?
     @State private var cleanupFolder: URL?
+    @State private var exportTask: Task<Void, Never>?
 
     private func exportAudio(_ format: String) {
-        Task {
+        exportTask = Task {
             do {
                 let url = try await store.exportAudio(id, format: format)
                 cleanupFolder = url.deletingLastPathComponent()
                 exportFile = ExportFile(url: url)
-            } catch { store.error = "音声を書き出せませんでした。\n\(voiceErrorDescription(error))" }
+            } catch {
+                if !Task.isCancelled { store.error = "音声を書き出せませんでした。\n\(voiceErrorDescription(error))" }
+            }
         }
     }
     var body: some View {
@@ -746,6 +759,7 @@ struct ClipView: View {
                     Results(jobIDs: clip.jobIDs, title: clip.title)
                 }
                 if store.sendingID == id { HStack { ProgressView(); Text(store.sendStatus).font(.caption) }.padding() }
+                if store.exportingID == id { ProgressView("音声を書き出しています…").padding() }
                 if !active { playback(clip) }
             }.navigationTitle(clip.title).navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .topBarTrailing) { Menu {
@@ -761,6 +775,7 @@ struct ClipView: View {
                 } label: { Image(systemName: "ellipsis.circle") } } }
                 .alert("名称変更", isPresented: $rename) { TextField("録音名", text: $name); Button("保存") { store.rename(id, name) }; Button("キャンセル", role: .cancel) {} }
                 .task(id: id) { if !store.recording { store.preparePlayback(clip) } }
+                .onDisappear { exportTask?.cancel() }
                 .confirmationDialog("書き出し形式", isPresented: $choosingExport, titleVisibility: .visible) {
                     Button("WAV") { exportAudio("wav") }
                     Button("M4A") { exportAudio("m4a") }
