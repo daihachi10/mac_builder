@@ -65,6 +65,20 @@ import AVFoundation
 }
 
 @MainActor final class UsageTests: XCTestCase {
+    func testServerAddressAcceptsHTTPSWithOrWithoutScheme() throws {
+        let store = try makeStore()
+        for address in [" local-test.invalid/voice/ ", "https://local-test.invalid/voice"] {
+            store.server = address
+            XCTAssertEqual(try store.endpoint("/api/jobs").absoluteString, "https://local-test.invalid/voice/api/jobs")
+        }
+        store.server = "local-test.invalid"
+        XCTAssertEqual(try store.endpoint("/api/jobs").absoluteString, "https://local-test.invalid/api/jobs")
+        for address in ["", "http://local-test.invalid", "https://user@local-test.invalid", "bad host.invalid"] {
+            store.server = address
+            XCTAssertThrowsError(try store.endpoint("/api/jobs"))
+        }
+    }
+
     func makeStore(_ supplied: UsageTransport? = nil) throws -> Store {
         let network = supplied ?? UsageTransport()
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("VoiceAudit-"+UUID().uuidString)

@@ -240,7 +240,12 @@ final class Capture: @unchecked Sendable {
     }
     func endpoint(_ path: String, _ query: [URLQueryItem] = []) throws -> URL {
         let base = server.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard var c = URLComponents(string: base), c.scheme == "https", c.host != nil, c.user == nil else { throw URLError(.badURL) }
+        let address = base.contains("://") ? base : "https://" + base
+        guard var c = URLComponents(string: address), c.scheme?.lowercased() == "https",
+              let host = c.host, !host.isEmpty, !host.contains(where: { $0.isWhitespace }),
+              c.user == nil, c.password == nil, c.query == nil, c.fragment == nil else {
+            throw URLError(.badURL)
+        }
         c.path += path; c.queryItems = query.isEmpty ? nil : query
         guard let result = c.url else { throw URLError(.badURL) }
         return result
@@ -262,7 +267,11 @@ final class Capture: @unchecked Sendable {
         do { jobs = try JSONDecoder().decode(JobsReply.self, from: await request("/api/jobs")).jobs; connectionMessage = "" }
         catch {
             connectionMessage = "サーバーに接続できません。録音は端末内に保存できます。"
-            if showError, self.error.isEmpty { self.error = "Tailscaleと接続先URLを確認してください。\n\(voiceErrorDescription(error))" }
+            if showError, self.error.isEmpty {
+                self.error = (error as? URLError)?.code == .badURL
+                    ? "設定のサーバーURLを確認してください。HTTPSのアドレスを入力してください。"
+                    : "Tailscaleと接続先URLを確認してください。\n\(voiceErrorDescription(error))"
+            }
         }
     }
     func artifacts(_ id: String) async throws -> [Artifact] { try JSONDecoder().decode(FilesReply.self, from: await request("/api/jobs/\(id)/files")).files }
@@ -911,7 +920,7 @@ struct Settings: View {
     @EnvironmentObject var store: Store
     @Environment(\.dismiss) var dismiss
     var body: some View { NavigationStack { Form {
-        Section("サーバー") { TextField("HTTPS URL（/voiceまで）", text: $store.server).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL); Text("同じTailscaleへ接続してください").font(.footnote); Button("接続確認") { Task { await store.refresh(showError: true) } } }
+        Section("サーバー") { TextField("サーバーのアドレス", text: $store.server).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL); Text("同じTailscaleへ接続してください").font(.footnote); Button("接続確認") { Task { await store.refresh(showError: true) } } }
         STTPicker(value: $store.sttBackend)
         Picker("丁寧化・要約エンジン", selection: $store.backend) { Text("ローカルLLM").tag("local"); Text("Sakura AI Engine").tag("sakura") }
         Text("さくら文字起こしを選ぶと、録音完了後の音声をサーバー経由でさくらのAI Engineへ送信します。").font(.footnote)
