@@ -135,12 +135,15 @@ import XCTest
     }
     func testSwipeDeleteAndRestoreLocalRecording() async throws {
         try await start(); record("Keep My Audio")
+        try await Task.sleep(nanoseconds:500_000_000)
         app.buttons["recording.pause"].firstMatch.tap()
         openLibrary()
         let row = app.cells.containing(.staticText,identifier:"Keep My Audio").firstMatch
         XCTAssertTrue(row.waitForExistence(timeout:5)); row.swipeLeft(); app.buttons["削除"].firstMatch.tap()
         app.buttons["library.menu"].tap(); pick("最近削除した項目")
-        XCTAssertTrue(row.waitForExistence(timeout:5)); row.swipeLeft()
+        XCTAssertTrue(row.waitForExistence(timeout:15))
+        XCTAssertTrue(row.staticTexts["PCに保存済み"].waitForExistence(timeout:15))
+        row.swipeLeft()
         app.buttons["完全に削除"].firstMatch.tap()
         let cancel = app.buttons["キャンセル"].firstMatch
         XCTAssertTrue(cancel.waitForExistence(timeout:5)); cancel.tap()

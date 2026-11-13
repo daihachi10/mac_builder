@@ -508,6 +508,7 @@ final class Capture: @unchecked Sendable {
     func uploadLocked(_ id: String) -> Bool { isBusy(id) || clips.contains { $0.id == id && ["ready", "sending"].contains($0.phase ?? "") } }
     func setSTT(_ id: String, _ value: String) { if !uploadLocked(id), let i = clips.firstIndex(where: { $0.id == id }) { clips[i].stt = value; save() } }
     func trash(_ clip: Clip) {
+        guard archiveTransferID == nil, !uploadLocked(clip.id), !(recording && active == clip.id) else { return }
         Task {
             do {
                 if clip.deleted { try await restoreRecording(clip.id) }
@@ -807,13 +808,15 @@ struct Library: View {
                             }
                             Button("名称変更", systemImage: "pencil") { renameID = clip.id; renameTitle = clip.title }
                             Button("文字起こしを表示", systemImage: "text.bubble") { selected = clip.id }
-                            Button("完了して送信", systemImage: "arrow.up.circle") { store.finish(clip.id) }
+                            if !clip.deleted { Button("完了して送信", systemImage: "arrow.up.circle") { store.finish(clip.id) } }
                             Button(clip.deleted ? "復元" : "削除", systemImage: clip.deleted ? "arrow.uturn.backward" : "trash", role: clip.deleted ? nil : .destructive) { store.trash(clip) }
+                                .disabled(store.archiveTransferID != nil || store.uploadLocked(clip.id) || (store.recording && store.active == clip.id))
                         }.swipeActions(edge: .trailing, allowsFullSwipe: !clip.deleted) {
                             if clip.deleted {
                                 Button("完全に削除", systemImage: "trash.slash") { deletion = clip }.tint(.red).disabled(store.uploadLocked(clip.id))
                             }
-                            Button { store.trash(clip) } label: { Label(clip.deleted ? "復元" : "削除", systemImage: clip.deleted ? "arrow.uturn.backward" : "trash") }.tint(clip.deleted ? .blue : .red).disabled(store.recording && store.active == clip.id)
+                            Button { store.trash(clip) } label: { Label(clip.deleted ? "復元" : "削除", systemImage: clip.deleted ? "arrow.uturn.backward" : "trash") }.tint(clip.deleted ? .blue : .red)
+                                .disabled(store.archiveTransferID != nil || store.uploadLocked(clip.id) || (store.recording && store.active == clip.id))
                         }
                     }
                 } else {

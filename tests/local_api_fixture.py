@@ -13,7 +13,7 @@ from urllib.parse import urlsplit, parse_qs, unquote
 LOCK = threading.Lock()
 STATE = {'offline': False, 'jobs': {}, 'uploads': [], 'events': []}
 ARCHIVES = {}
-ARCHIVE_ROUTE = '/api/mobile/recording-archive'
+ARCHIVE_ROUTE = '/voice/api/mobile/recording-archive'
 TRANSCRIPT = '今日は図書館で金融資本について勉強しました。教科書の資料を次回までに用意します。'
 
 
