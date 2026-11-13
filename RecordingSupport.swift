@@ -1,6 +1,12 @@
 import Foundation
 import AVFoundation
 
+struct ArchivedRecording: Codable {
+    let url: URL
+    let sha256: String
+    let bytes: Int64
+}
+
 struct Clip: Codable, Identifiable {
     var id = UUID().uuidString
     var title: String
@@ -15,6 +21,8 @@ struct Clip: Codable, Identifiable {
     var stt: String? = "local"
     var finalJob: String?
     var unavailableParts: [String]?
+    var archivedRecording: ArchivedRecording?
+    var pendingAudioRemoval: [String]?
     var jobIDs: [String] {
         if let finalJob { return [finalJob] }
         let matched = parts.compactMap { part in
@@ -26,7 +34,7 @@ struct Clip: Codable, Identifiable {
         var seen = Set<String>()
         return values.filter { seen.insert($0).inserted }
     }
-    var isDraft: Bool { phase == "paused" || phase == "recording" }
+    var isDraft: Bool { archivedRecording == nil && (phase == "paused" || phase == "recording") }
 }
 
 func timeText(_ seconds: Double) -> String {

@@ -15,12 +15,18 @@ import AVFoundation
     var concurrent = 0
     var maximumConcurrent = 0
     var uploadedDurations: [Double] = []
+    var archives: [String: Data] = [:]
+    var rejectArchive = false
     func response(_ r: URLRequest, _ value: Any, status: Int = 200) throws -> (Data, URLResponse) {
         (try JSONSerialization.data(withJSONObject: value), HTTPURLResponse(url: r.url!, statusCode: status, httpVersion: "HTTP/1.1", headerFields: nil)!)
     }
     func data(for r: URLRequest) async throws -> (Data, URLResponse) {
         guard !offline else { throw URLError(.notConnectedToInternet) }
         let path = r.url!.path
+        if path.hasSuffix("/recording-archive") { return try response(r, ["version": 1]) }
+        if path.contains("/recording-archive/"), let audio = archives[r.url!.lastPathComponent] {
+            return (audio, HTTPURLResponse(url: r.url!, statusCode: 200, httpVersion: nil, headerFields: nil)!)
+        }
         let query = URLComponents(url: r.url!, resolvingAgainstBaseURL: false)?.queryItems ?? []
         XCTAssertFalse(query.contains { $0.value == "sakura" }, "Sakura must never be used by this suite")
         if path.hasSuffix("/transcript") { return try response(r, ["status":"completed", "progress":"完了", "error":"", "text":text, "empty":text.isEmpty, "message":text.isEmpty ? "音声から文字を検出できませんでした。" : ""]) }
@@ -37,6 +43,13 @@ import AVFoundation
     }
     func upload(for r: URLRequest, fromFile file: URL) async throws -> (Data, URLResponse) {
         guard !offline else { throw URLError(.notConnectedToInternet) }
+        if r.httpMethod == "PUT" {
+            if rejectArchive { return try response(r, ["detail": "Storage full"], status: 507) }
+            let data = try Data(contentsOf: file)
+            let digest = r.url!.lastPathComponent
+            archives[digest] = data
+            return try response(r, ["sha256": digest, "bytes": data.count])
+        }
         let query = URLComponents(url:r.url!,resolvingAgainstBaseURL:false)!.queryItems!
         XCTAssertEqual(query.first(where:{$0.name == "stt_backend"})?.value, "local")
         let data = try Data(contentsOf:file)
@@ -83,7 +96,7 @@ import AVFoundation
         let network = supplied ?? UsageTransport()
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent("VoiceAudit-"+UUID().uuidString)
         let store = Store(directory:folder,transport:network)
-        store.server = "https://local-test.invalid/voice"; store.backend = "local"; store.sttBackend = "local"
+        store.server = "https://local-test.invalid/voice"; store.archiveServer = ""; store.backend = "local"; store.sttBackend = "local"
         store.requestPermission = { true }
         store.recorderFactory = { let capture = Capture(); capture.fixtureMode = true; return capture }
         addTeardownBlock {
@@ -240,14 +253,39 @@ import AVFoundation
         result = await ArtifactReading.load(["job"],kind:"detailed",store:store)
         XCTAssertTrue(result.failure.contains(network.generationError))
     }
-    func testTrashRestoreAndLongCacheNames() throws {
-        let store = try makeStore(), clip = try addClip(store)
-        store.trash(clip); XCTAssertTrue(store.clips[0].deleted)
-        store.trash(store.clips[0]); XCTAssertFalse(store.clips[0].deleted)
+    func testTrashRestoreAndLongCacheNames() async throws {
+        let network = UsageTransport(), store = try makeStore(network), clip = try addClip(store)
+        let original = store.root.appendingPathComponent(clip.parts[0])
+        network.rejectArchive = true
+        store.trash(clip)
+        try await waitUntil({ !store.error.isEmpty })
+        XCTAssertFalse(store.clips[0].deleted)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: original.path))
+        store.error = ""
+        network.rejectArchive = false
+        store.trash(clip)
+        try await waitUntil({ store.clips[0].deleted && !store.isBusy(clip.id) })
+        XCTAssertTrue(store.clips[0].parts.isEmpty)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: original.path))
+        let reloaded = Store(directory: store.root, transport: network)
+        XCTAssertNotNil(reloaded.clips[0].archivedRecording)
+        reloaded.trash(reloaded.clips[0])
+        try await waitUntil({ !reloaded.clips[0].deleted && !reloaded.isBusy(clip.id) })
+        XCTAssertEqual(reloaded.clips[0].duration, clip.duration, accuracy: 0.15)
+        XCTAssertEqual(reloaded.clips[0].parts.count, 1)
         let key = String(repeating:"長い名前/",count:120)
         store.cache(key,"本文")
         XCTAssertEqual(store.cached(key),"本文")
         XCTAssertLessThan(store.cacheURL(key).lastPathComponent.count,100)
+    }
+    func testMigrationOfExistingDeletedRecording() async throws {
+        let store = try makeStore(), clip = try addClip(store)
+        store.clips[0].deleted = true
+        store.save()
+        await store.migrateDeletedRecordings()
+        XCTAssertTrue(store.clips[0].deleted)
+        XCTAssertNotNil(store.clips[0].archivedRecording)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: store.root.appendingPathComponent(clip.parts[0]).path))
     }
     func testMissingSegmentNeverSilentlyUploadsPartialAudio() async throws {
         let network = UsageTransport(), store = try makeStore(network), clip = try addClip(store)

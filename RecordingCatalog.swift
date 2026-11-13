@@ -38,7 +38,7 @@ enum RecordingCatalog {
         let others = Set(clips.filter { $0.id != clip.id }.flatMap { other in
             other.parts.compactMap { localURL($0, clipID: other.id, root: root)?.path }
         })
-        let owned = clip.parts.compactMap { localURL($0, clipID: clip.id, root: root) }
+        let owned = (clip.parts + (clip.pendingAudioRemoval ?? [])).compactMap { localURL($0, clipID: clip.id, root: root) }
         let folder = root.appendingPathComponent(clip.id)
         guard relative(folder, root: root) == clip.id,
               !others.contains(where: { $0.hasPrefix(folder.path + "/") }) else { throw CocoaError(.fileWriteInvalidFileName) }
@@ -52,6 +52,38 @@ enum RecordingCatalog {
             try JSONEncoder().encode(pending).write(to: root.appendingPathComponent("deleted-recordings.json"), options: .atomic)
         }
         try completeDeletions(pending, root: root)
+    }
+
+    static func audioToRemove(_ clip: Clip, from clips: [Clip], root: URL) throws -> [String] {
+        let folder = root.appendingPathComponent(clip.id)
+        guard validID(clip.id), relative(folder, root: root) == clip.id else {
+            throw CocoaError(.fileWriteInvalidFileName)
+        }
+        let folderAudio = FileManager.default.fileExists(atPath: folder.path)
+            ? try FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) : []
+        let parts = clip.parts.compactMap { localURL($0, clipID: clip.id, root: root) }
+        let otherAudio = Set(clips.filter { $0.id != clip.id }.flatMap { other in
+            other.parts.compactMap { localURL($0, clipID: other.id, root: root) }.map(\.path)
+        })
+        let paths: [String] = (folderAudio + parts).compactMap { url in
+            guard ["wav", "m4a"].contains(url.pathExtension.lowercased()), !otherAudio.contains(url.path),
+                  let path = relative(url, root: root), path.hasPrefix(clip.id + "/") || !path.contains("/") else { return nil }
+            return path
+        }
+        return Array(Set(paths)).sorted()
+    }
+
+    static func removeArchivedAudio(_ clip: Clip, root: URL) throws {
+        guard clip.deleted, clip.archivedRecording != nil, validID(clip.id) else { return }
+        for path in clip.pendingAudioRemoval ?? [] {
+            let url = root.appendingPathComponent(path)
+            guard relative(url, root: root) == path, ["wav", "m4a"].contains(url.pathExtension.lowercased()),
+                  path.hasPrefix(clip.id + "/") || !path.contains("/") else {
+                throw CocoaError(.fileWriteInvalidFileName)
+            }
+            do { try FileManager.default.removeItem(at: url) }
+            catch let error as CocoaError where error.code == .fileNoSuchFile || error.code == .fileReadNoSuchFile {}
+        }
     }
     struct Loaded { var clips: [Clip]; var recovered: Bool }
     private static func validID(_ id: String) -> Bool { !id.isEmpty && !id.contains("/") && !id.contains("\\") && id != "." && id != ".." }

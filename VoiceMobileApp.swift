@@ -149,6 +149,10 @@ final class Capture: @unchecked Sendable {
     @Published var playTime: Double = 0
     @Published var playDuration: Double = 0
     @AppStorage("serverURL") var server = ""
+    @AppStorage("archiveServerURL") var archiveServer = ""
+    @Published var archiveTransferID: String?
+    @Published var migratingDeleted = false
+    private var temporaryPlayback: URL?
     @Published var needsServerSettings = false
     @Published var exportingID: String?
     @AppStorage("backend") var backend = "local"
@@ -201,11 +205,23 @@ final class Capture: @unchecked Sendable {
         } catch { storageReady = false; self.error = "録音一覧を開けませんでした。\n\(voiceErrorDescription(error))" }
         let files = (try? FileManager.default.contentsOfDirectory(at: root, includingPropertiesForKeys: nil)) ?? []
         for url in files where storageReady && ["m4a", "wav"].contains(url.pathExtension) {
-            if !clips.contains(where: { $0.parts.contains(url.lastPathComponent) }) {
+            if !clips.contains(where: { $0.parts.contains(url.lastPathComponent) || $0.pendingAudioRemoval?.contains(url.lastPathComponent) == true }) {
                 clips.append(Clip(title: url.deletingPathExtension().lastPathComponent, parts: [url.lastPathComponent], phase: "paused"))
             }
         }
         for i in clips.indices {
+            if clips[i].archivedRecording != nil {
+                do {
+                    try RecordingCatalog.removeArchivedAudio(clips[i], root: root)
+                    clips[i].pendingAudioRemoval = nil
+                    let interruptedRestore = root.appendingPathComponent(clips[i].id).appendingPathComponent("000000.m4a")
+                    if RecordingCatalog.relative(interruptedRestore, root: root) == clips[i].id + "/000000.m4a",
+                       FileManager.default.fileExists(atPath: interruptedRestore.path) {
+                        try FileManager.default.removeItem(at: interruptedRestore)
+                    }
+                } catch { self.error = "端末の音声を削除できませんでした。\n\(voiceErrorDescription(error))" }
+                continue
+            }
             // Rebuild the catalog from closed/repairable local files after interruption.
             reconcile(i)
             if clips[i].phase == nil { clips[i].phase = clips[i].jobIDs.isEmpty ? "paused" : "saved" }
@@ -222,6 +238,7 @@ final class Capture: @unchecked Sendable {
         catch { self.error = error.localizedDescription }
     }
     func reconcile(_ i: Int) {
+        guard clips[i].archivedRecording == nil else { return }
         let folder = root.appendingPathComponent(clips[i].id)
         let urls = ((try? FileManager.default.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)) ?? [])
             .filter { $0.pathExtension == "wav" && !$0.lastPathComponent.hasPrefix("export-") }
@@ -238,8 +255,8 @@ final class Capture: @unchecked Sendable {
         clips[i].unavailableParts = missing.isEmpty ? nil : missing
         clips[i].duration = sorted.reduce(0) { $0 + RecordingFiles.duration($1) }
     }
-    func endpoint(_ path: String, _ query: [URLQueryItem] = []) throws -> URL {
-        let base = server.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+    func endpoint(_ path: String, _ query: [URLQueryItem] = [], serverAddress: String? = nil) throws -> URL {
+        let base = (serverAddress ?? server).trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let address = base.contains("://") ? base : "https://" + base
         guard var c = URLComponents(string: address), c.scheme?.lowercased() == "https",
               let host = c.host, !host.isEmpty, !host.contains(where: { $0.isWhitespace }),
@@ -453,7 +470,7 @@ final class Capture: @unchecked Sendable {
         await refresh()
     }
     func rename(_ id: String, _ title: String) { if let i = clips.firstIndex(where: { $0.id == id }), !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { clips[i].title = title; save() } }
-    func isBusy(_ id: String) -> Bool { sendingID == id || pending.contains(id) || exportingID == id }
+    func isBusy(_ id: String) -> Bool { sendingID == id || pending.contains(id) || exportingID == id || archiveTransferID == id }
 
     func exportAudio(_ id: String, format: String) async throws -> URL {
         guard storageReady, exportingID == nil, !uploadLocked(id), !(recording && active == id),
@@ -491,19 +508,139 @@ final class Capture: @unchecked Sendable {
     func uploadLocked(_ id: String) -> Bool { isBusy(id) || clips.contains { $0.id == id && ["ready", "sending"].contains($0.phase ?? "") } }
     func setSTT(_ id: String, _ value: String) { if !uploadLocked(id), let i = clips.firstIndex(where: { $0.id == id }) { clips[i].stt = value; save() } }
     func trash(_ clip: Clip) {
-        if clip.deleted {
+        Task {
             do {
-                guard try !RecordingCatalog.deletionStarted(clip.id, root: root) else {
-                    error = "完全削除を開始した録音です。「完全に削除」から再試行してください。"
-                    return
-                }
-            } catch { self.error = voiceErrorDescription(error); return }
+                if clip.deleted { try await restoreRecording(clip.id) }
+                else { try await archiveRecording(clip.id) }
+            } catch {
+                self.error = "録音を移動できませんでした。Windows PCの接続と保存先の設定を確認してください。\n\(voiceErrorDescription(error))"
+            }
         }
-        guard !(recording && active == clip.id), !uploadLocked(clip.id) else { return }
-        if let i = clips.firstIndex(where: { $0.id == clip.id }) { clips[i].deleted.toggle(); save() }
+    }
+    func migrateDeletedRecordings() async {
+        guard !migratingDeleted, archiveTransferID == nil else { return }
+        migratingDeleted = true
+        defer { migratingDeleted = false }
+        let ids = clips.filter { $0.deleted && ($0.archivedRecording == nil || $0.pendingAudioRemoval != nil) }.map(\.id)
+        var failed = 0
+        var lastError = ""
+        for id in ids {
+            do { try await archiveRecording(id) }
+            catch { failed += 1; lastError = error.localizedDescription }
+        }
+        if failed > 0 { error = "\(failed)件を移動できませんでした。\n\(lastError)" }
+    }
+    private func commitClip(_ updated: Clip) throws {
+        guard let index = clips.firstIndex(where: { $0.id == updated.id }) else { throw CocoaError(.fileNoSuchFile) }
+        var next = clips
+        next[index] = updated
+        try RecordingCatalog.save(next, to: root)
+        clips = next
+    }
+    private func checkArchiveAccess(_ id: String) throws -> Clip {
+        guard storageReady, archiveTransferID == nil, !uploadLocked(id), !(recording && active == id),
+              let clip = clips.first(where: { $0.id == id }) else { throw CocoaError(.fileWriteUnknown) }
+        guard try !RecordingCatalog.deletionStarted(id, root: root) else { throw CocoaError(.fileNoSuchFile) }
+        return clip
+    }
+    private func archiveRecording(_ id: String) async throws {
+        var clip = try checkArchiveAccess(id)
+        archiveTransferID = id
+        defer { archiveTransferID = nil }
+        if clip.archivedRecording == nil {
+            let address = archiveServer.trimmingCharacters(in: .whitespacesAndNewlines)
+            let target = try endpoint("/api/mobile/recording-archive", serverAddress: address.isEmpty ? server : address)
+            let (data, response) = try await transport.data(for: URLRequest(url: target, timeoutInterval: 15))
+            guard (response as? HTTPURLResponse)?.statusCode == 200,
+                  (try? JSONDecoder().decode([String: Int].self, from: data))?["version"] == 1 else {
+                throw NSError(domain: "VoiceArchive", code: 1, userInfo: [NSLocalizedDescriptionKey: "設定で録音の保存先に対応するWindows PCのアドレスを指定してください。"])
+            }
+            guard let index = clips.firstIndex(where: { $0.id == id }) else { throw CocoaError(.fileNoSuchFile) }
+            reconcile(index)
+            clip = clips[index]
+            guard clip.unavailableParts?.isEmpty != false, !clip.parts.isEmpty else { throw URLError(.cannotDecodeRawData) }
+            let folder = FileManager.default.temporaryDirectory.appendingPathComponent("voice-export-" + UUID().uuidString)
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+            defer { try? FileManager.default.removeItem(at: folder) }
+            let file = folder.appendingPathComponent("recording.m4a")
+            try await RecordingFiles.exportAudio(clip.parts.map { root.appendingPathComponent($0) }, to: file, enhanceSpeech: false)
+            let duration = RecordingFiles.duration(file)
+            guard duration > 0, abs(duration - clip.duration) <= max(0.15, clip.duration * 0.0001) else {
+                throw URLError(.cannotDecodeRawData)
+            }
+            let (sha, bytes) = try await Self.audioChecksum(file)
+            let url = target.appendingPathComponent(sha)
+            var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 600)
+            request.httpMethod = "PUT"
+            request.setValue("audio/mp4", forHTTPHeaderField: "Content-Type")
+            request.setValue(String(bytes), forHTTPHeaderField: "Content-Length")
+            let (reply, uploadResponse) = try await transport.upload(for: request, fromFile: file)
+            guard (uploadResponse as? HTTPURLResponse)?.statusCode == 200,
+                  let receipt = try? JSONDecoder().decode(ArchiveReceipt.self, from: reply),
+                  receipt.sha256 == sha, receipt.bytes == bytes else { throw URLError(.badServerResponse) }
+            // Commit the verified PC reference before removing any local audio.
+            if let current = clips.first(where: { $0.id == id }) { clip.title = current.title }
+            clip.pendingAudioRemoval = try RecordingCatalog.audioToRemove(clip, from: clips, root: root)
+            clip.archivedRecording = ArchivedRecording(url: url, sha256: sha, bytes: bytes)
+            clip.deleted = true
+            clip.parts = []
+            clip.unavailableParts = nil
+            try commitClip(clip)
+        }
+        if playingID == id { stopPlayback() }
+        try RecordingCatalog.removeArchivedAudio(clip, root: root)
+        clip.pendingAudioRemoval = nil
+        try commitClip(clip)
+    }
+    private struct ArchiveReceipt: Decodable { let sha256: String; let bytes: Int64 }
+    private nonisolated static func audioChecksum(_ file: URL) async throws -> (String, Int64) {
+        try await Task.detached {
+            let input = try FileHandle(forReadingFrom: file)
+            defer { try? input.close() }
+            var hash = SHA256()
+            var count: Int64 = 0
+            while let data = try input.read(upToCount: 1024 * 1024), !data.isEmpty {
+                hash.update(data: data)
+                count += Int64(data.count)
+            }
+            return (hash.finalize().map { String(format: "%02x", $0) }.joined(), count)
+        }.value
+    }
+    private func downloadArchive(_ archive: ArchivedRecording, into output: URL) async throws {
+        let request = URLRequest(url: archive.url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 600)
+        let (file, response) = try await transport.download(for: request)
+        defer { try? FileManager.default.removeItem(at: file) }
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+        let (sha, bytes) = try await Self.audioChecksum(file)
+        guard sha == archive.sha256, bytes == archive.bytes else { throw URLError(.cannotDecodeRawData) }
+        try FileManager.default.moveItem(at: file, to: output)
+    }
+    private func restoreRecording(_ id: String) async throws {
+        var clip = try checkArchiveAccess(id)
+        guard clip.deleted else { return }
+        archiveTransferID = id
+        defer { archiveTransferID = nil }
+        if let archive = clip.archivedRecording {
+            if playingID == id { stopPlayback() }
+            try RecordingCatalog.removeArchivedAudio(clip, root: root)
+            let folder = root.appendingPathComponent(id)
+            let path = folder.appendingPathComponent("000000.m4a")
+            guard RecordingCatalog.relative(path, root: root) == id + "/000000.m4a" else {
+                throw CocoaError(.fileWriteInvalidFileName)
+            }
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            if FileManager.default.fileExists(atPath: path.path) { try FileManager.default.removeItem(at: path) }
+            try await downloadArchive(archive, into: path)
+            clip.parts = [id + "/000000.m4a"]
+            clip.archivedRecording = nil
+            clip.pendingAudioRemoval = nil
+            if let current = clips.first(where: { $0.id == id }) { clip.title = current.title }
+        }
+        clip.deleted = false
+        try commitClip(clip)
     }
     func preparePlayback(_ clip: Clip) {
-        guard !recording else { return }
+        guard !recording, clip.archivedRecording == nil else { return }
         if playingID == clip.id { return }
         if preview { playingID = clip.id; playDuration = clip.duration; playTime = 0; return }
         stopPlayback()
@@ -513,6 +650,33 @@ final class Capture: @unchecked Sendable {
     }
     func play(_ clip: Clip) {
         guard !recording else { return }
+        if let archive = clip.archivedRecording, playingID != clip.id {
+            guard archiveTransferID == nil else { return }
+            archiveTransferID = clip.id
+            Task {
+                defer { archiveTransferID = nil }
+                let folder = FileManager.default.temporaryDirectory.appendingPathComponent("voice-export-" + UUID().uuidString)
+                let file = folder.appendingPathComponent("recording.m4a")
+                do {
+                    try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: false)
+                    try await downloadArchive(archive, into: file)
+                    guard !recording else { try FileManager.default.removeItem(at: folder); return }
+                    stopPlayback()
+                    let duration = RecordingFiles.duration(file)
+                    guard duration > 0 else { throw URLError(.cannotDecodeRawData) }
+                    temporaryPlayback = folder
+                    playbackURLs = [file]
+                    timeline = PlaybackTimeline(durations: [duration])
+                    playingID = clip.id
+                    playDuration = duration
+                    seek(0, start: true)
+                } catch {
+                    try? FileManager.default.removeItem(at: folder)
+                    self.error = "Windows PCの録音を再生できませんでした。\n\(voiceErrorDescription(error))"
+                }
+            }
+            return
+        }
         preparePlayback(clip)
         if isPlaying { player?.pause(); isPlaying = false; return }
         if playTime >= playDuration { playTime = 0 }
@@ -521,6 +685,8 @@ final class Capture: @unchecked Sendable {
     func stopPlayback() {
         player?.stop(); player = nil; isPlaying = false; playingID = nil
         playbackTimer?.invalidate(); playbackURLs = []; playTime = 0; playDuration = 0
+        if let temporaryPlayback { try? FileManager.default.removeItem(at: temporaryPlayback) }
+        temporaryPlayback = nil
     }
     func skip(_ seconds: Double) { seek(playTime + seconds, start: isPlaying) }
     func seek(_ seconds: Double, start: Bool? = nil) {
@@ -593,7 +759,7 @@ extension Store: AVAudioPlayerDelegate {
             UIView.setAnimationsEnabled(false)
             let root = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("UITestRecordings").appendingPathComponent(args[caseIndex + 1])
             let store = Store(directory: root)
-            store.server = url.absoluteString; store.backend = "local"; store.sttBackend = "local"
+            store.server = url.absoluteString; store.archiveServer = ""; store.backend = "local"; store.sttBackend = "local"
             store.requestPermission = { true }
             store.recorderFactory = { let capture = Capture(); capture.fixtureMode = true; return capture }
             return store
@@ -620,12 +786,20 @@ struct Library: View {
             List(selection: $selected) {
                 if !store.connectionMessage.isEmpty { Text(store.connectionMessage).font(.footnote).foregroundStyle(.secondary).accessibilityIdentifier("connection.message") }
                 Text(source == 1 ? "\(store.jobs.count)件の録音" : "\(store.clips.filter { $0.deleted == (source == 2) }.count)件の録音").font(.caption).foregroundStyle(.secondary).listRowSeparator(.hidden)
+                if source == 2 && store.clips.contains(where: { $0.deleted && ($0.archivedRecording == nil || $0.pendingAudioRemoval != nil) }) {
+                    Button("端末の録音をまとめてPCに移す", systemImage: "externaldrive") {
+                        Task { await store.migrateDeletedRecordings() }
+                    }.disabled(store.migratingDeleted || store.archiveTransferID != nil)
+                }
+                if store.migratingDeleted { ProgressView("削除済みの録音を移動中…") }
                 if source != 1 {
                     ForEach(store.clips.filter { $0.deleted == (source == 2) && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }) { clip in
                         NavigationLink(value: clip.id) {
                             VStack(alignment: .leading, spacing: 8) {
                                 Text(clip.title).font(.headline).lineLimit(1)
                                 HStack { Text(clip.date, style: .date); Image(systemName: clip.isDraft ? "pause.circle" : "text.bubble"); Spacer(); Text(timeText(store.active == clip.id && store.recording ? store.seconds : clip.duration)).lineLimit(1).monospacedDigit() }.font(.subheadline).foregroundStyle(.secondary)
+                                if store.archiveTransferID == clip.id { ProgressView().controlSize(.small) }
+                                else if clip.archivedRecording != nil { Label("PCに保存済み", systemImage: "externaldrive").font(.caption).foregroundStyle(.secondary) }
                             }.padding(.vertical, 8)
                         }.contextMenu {
                             if clip.deleted {
@@ -680,7 +854,7 @@ struct Library: View {
         .confirmationDialog("この録音を端末から完全に削除しますか？", isPresented: Binding(get: { deletion != nil }, set: { if !$0 { deletion = nil } }), titleVisibility: .visible, presenting: deletion) { clip in
             Button("完全に削除", role: .destructive) { store.permanentlyDelete(clip); deletion = nil }
             Button("キャンセル", role: .cancel) { deletion = nil }
-        } message: { clip in Text(clip.title) }
+        } message: { clip in Text(clip.archivedRecording != nil ? "「\(clip.title)」を一覧から消します。PCの音声は残ります。" : "「\(clip.title)」の端末内の音声を消します。先にPCへ移す場合はキャンセルしてください。") }
         .alert("名称変更", isPresented: Binding(get: { renameID != nil }, set: { if !$0 { renameID = nil } })) {
             TextField("録音名", text: $renameTitle)
             Button("保存") { if let id = renameID { store.rename(id, renameTitle) }; renameID = nil }
@@ -760,7 +934,7 @@ struct ClipView: View {
                         Spacer()
                         RecordingControls(id: id)
                     }.padding(24)
-                } else if clip.isDraft && clip.finalJob == nil {
+                } else if clip.isDraft && clip.finalJob == nil && !clip.deleted {
                     VStack(spacing: 24) {
                         Image(systemName: "pause.circle").font(.system(size: 50)).foregroundStyle(.secondary)
                         Text(timeText(clip.duration)).font(.largeTitle.monospacedDigit()).lineLimit(1).fixedSize()
@@ -769,11 +943,14 @@ struct ClipView: View {
                         HStack { Button("録音を再開") { Task { await store.resume(id) } }.buttonStyle(.glass).accessibilityIdentifier("recording.resume"); Button("完了して送信") { store.finish(id) }.buttonStyle(.glassProminent).tint(.red).accessibilityIdentifier("recording.send") }.disabled(store.recording || store.uploadLocked(id))
                         Spacer()
                     }.padding(24)
+                } else if clip.archivedRecording != nil && clip.jobIDs.isEmpty {
+                    ContentUnavailableView("PCに保存済み", systemImage: "externaldrive", description: Text("再生を押すとPCから音声を取得します。"))
                 } else {
                     Results(jobIDs: clip.jobIDs, title: clip.title)
                 }
                 if store.sendingID == id { HStack { ProgressView(); Text(store.sendStatus).font(.caption) }.padding() }
                 if store.exportingID == id { ProgressView("音声を書き出しています…").padding() }
+                if store.archiveTransferID == id { ProgressView("PCと録音を転送中…").padding() }
                 if !active { playback(clip) }
             }.navigationTitle(clip.title).navigationBarTitleDisplayMode(.inline)
                 .toolbar { ToolbarItem(placement: .topBarTrailing) { Menu {
@@ -782,14 +959,20 @@ struct ClipView: View {
                             .disabled(store.uploadLocked(id) || store.exportingID != nil || active || clip.parts.isEmpty)
                     }
                     Button("名称変更") { name = clip.title; rename = true }
-                    Button("録音を再開") { Task { await store.resume(id) } }.disabled(store.recording || store.sendingID == id)
-                    STTPicker(value: Binding(get: { clip.stt ?? store.sttBackend }, set: { store.setSTT(id, $0) }))
-                    Button("完了して送信・再送") { store.finish(id) }.disabled(store.recording || store.sendingID == id)
+                    if !clip.deleted {
+                        Button("録音を再開") { Task { await store.resume(id) } }.disabled(store.recording || store.uploadLocked(id))
+                        STTPicker(value: Binding(get: { clip.stt ?? store.sttBackend }, set: { store.setSTT(id, $0) }))
+                        Button("完了して送信・再送") { store.finish(id) }.disabled(store.recording || store.uploadLocked(id))
+                    }
                     Button(clip.deleted ? "復元" : "削除") { store.trash(clip) }
+                        .disabled(store.archiveTransferID != nil || store.uploadLocked(id) || active)
                 } label: { Image(systemName: "ellipsis.circle") } } }
                 .alert("名称変更", isPresented: $rename) { TextField("録音名", text: $name); Button("保存") { store.rename(id, name) }; Button("キャンセル", role: .cancel) {} }
                 .task(id: id) { if !store.recording { store.preparePlayback(clip) } }
-                .onDisappear { exportTask?.cancel() }
+                .onDisappear {
+                    exportTask?.cancel()
+                    if clip.archivedRecording != nil && store.playingID == id { store.stopPlayback() }
+                }
                 .confirmationDialog("書き出し形式", isPresented: $choosingExport, titleVisibility: .visible) {
                     Button("WAV") { exportAudio("wav") }
                     Button("M4A") { exportAudio("m4a") }
@@ -921,6 +1104,11 @@ struct Settings: View {
     @Environment(\.dismiss) var dismiss
     var body: some View { NavigationStack { Form {
         Section("サーバー") { TextField("サーバーのアドレス", text: $store.server).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL); Text("同じTailscaleへ接続してください").font(.footnote); Button("接続確認") { Task { await store.refresh(showError: true) } } }
+        Section("削除した録音の保存先") {
+            TextField("Windows PCのアドレス", text: $store.archiveServer)
+                .textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.URL)
+            Text("文字起こしサーバーがWindows PCなら空欄で使えます。").font(.footnote)
+        }
         STTPicker(value: $store.sttBackend)
         Picker("丁寧化・要約エンジン", selection: $store.backend) { Text("ローカルLLM").tag("local"); Text("Sakura AI Engine").tag("sakura") }
         Text("さくら文字起こしを選ぶと、録音完了後の音声をサーバー経由でさくらのAI Engineへ送信します。").font(.footnote)

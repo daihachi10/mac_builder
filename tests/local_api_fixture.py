@@ -12,6 +12,8 @@ from urllib.parse import urlsplit, parse_qs, unquote
 
 LOCK = threading.Lock()
 STATE = {'offline': False, 'jobs': {}, 'uploads': [], 'events': []}
+ARCHIVES = {}
+ARCHIVE_ROUTE = '/api/mobile/recording-archive'
 TRANSCRIPT = '今日は図書館で金融資本について勉強しました。教科書の資料を次回までに用意します。'
 
 
@@ -47,6 +49,21 @@ class Handler(BaseHTTPRequestHandler):
         if STATE['offline']:
             self.reply({'detail': 'Test connection unavailable'}, 503)
             return
+        if path == ARCHIVE_ROUTE:
+            self.reply({'version': 1})
+            return
+        if path.startswith(ARCHIVE_ROUTE + '/'):
+            with LOCK:
+                audio = ARCHIVES.get(path.rsplit('/', 1)[1])
+            if audio is None:
+                self.reply({'detail': 'Recording not found'}, 404)
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'audio/mp4')
+            self.send_header('Content-Length', str(len(audio)))
+            self.end_headers()
+            self.wfile.write(audio)
+            return
         if path.endswith('/api/jobs'):
             self.reply({'jobs': list(STATE['jobs'].values())})
             return
@@ -72,6 +89,21 @@ class Handler(BaseHTTPRequestHandler):
         elif path.endswith('/polish'): self.reply({'polish': []})
         else: self.reply({'detail': 'Unknown route'}, 404)
 
+    def do_PUT(self):
+        path = urlsplit(self.path).path
+        size = int(self.headers.get('Content-Length', '0'))
+        if not path.startswith(ARCHIVE_ROUTE + '/') or not 0 < size <= 16 * 1024 * 1024:
+            self.reply({'detail': 'Invalid archive request'}, 400)
+            return
+        audio = self.rfile.read(size)
+        digest = hashlib.sha256(audio).hexdigest()
+        if len(audio) != size or path != ARCHIVE_ROUTE + '/' + digest:
+            self.reply({'detail': 'Invalid archive checksum'}, 422)
+            return
+        with LOCK:
+            ARCHIVES[digest] = audio
+        self.reply({'sha256': digest, 'bytes': size})
+
     def do_POST(self):
         parsed = urlsplit(self.path)
         query = parse_qs(parsed.query)
@@ -83,7 +115,9 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == '/__control':
             control = json.loads(data or b'{}')
             with LOCK:
-                if control.get('reset'): STATE.update(offline=False, jobs={}, uploads=[], events=[])
+                if control.get('reset'):
+                    STATE.update(offline=False, jobs={}, uploads=[], events=[])
+                    ARCHIVES.clear()
                 if 'offline' in control: STATE['offline'] = bool(control['offline'])
             self.reply({'ok': True})
             return
